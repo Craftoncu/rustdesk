@@ -4,6 +4,7 @@ use hbb_common::{config::LocalConfig, log, ResultType};
 use reqwest::blocking::Client;
 use serde_derive::{Deserialize, Serialize};
 use serde_repr::{Deserialize_repr, Serialize_repr};
+use serde_json::{Map as JsonMap, Value as JsonValue};
 use std::{
     collections::HashMap,
     sync::{Arc, RwLock},
@@ -169,19 +170,80 @@ impl OidcSession {
             masked_uuid,
             device_info
         );
-        Ok(OIDC_SESSION
-            .read()
-            .unwrap()
-            .client
-            .post(format!("{}/api/oidc/auth", api_server))
-            .json(&serde_json::json!({
-                "op": op,
-                "id": id,
-                "uuid": uuid,
-                "deviceInfo": device_info,
-            }))
-            .send()?
-            .try_into()?)
+
+        // Full request logging (unmasked) for troubleshooting
+        let url = format!("{}/api/oidc/auth", api_server);
+        let req_body = serde_json::json!({
+            "op": op,
+            "id": id,
+            "uuid": uuid,
+            "deviceInfo": device_info,
+        });
+        log::debug!("[OIDC][RAW] -> POST {}\nBody: {}", url, req_body.to_string());
+
+        let client = { OIDC_SESSION.read().unwrap().client.clone() };
+        let resp = match client.post(&url).json(&req_body).send() {
+            Ok(r) => r,
+            Err(e) => {
+                log::error!(
+                    "[OIDC][RAW] POST send error: {}\nURL: {}\nBody: {}",
+                    e,
+                    url,
+                    req_body.to_string()
+                );
+                return Err(e.into());
+            }
+        };
+
+        let status = resp.status();
+        let headers = resp.headers().clone();
+        let final_url = resp.url().clone();
+        let raw = match resp.text() {
+            Ok(t) => t,
+            Err(e) => {
+                log::error!(
+                    "[OIDC][RAW] Error reading response body: {}\nStatus: {}\nURL: {}\nHeaders: {:?}",
+                    e,
+                    status,
+                    final_url,
+                    headers
+                );
+                return Err(e.into());
+            }
+        };
+
+        log::debug!(
+            "[OIDC][RAW] <- Response\nStatus: {}\nURL: {}\nHeaders: {:?}\nBody: {}",
+            status,
+            final_url,
+            headers,
+            raw
+        );
+
+        // Parse into HbbHttpResponse like TryFrom<Response>
+        match serde_json::from_str::<JsonMap<String, JsonValue>>(&raw) {
+            Ok(map) => {
+                if let Some(error) = map.get("error") {
+                    if let Some(err_str) = error.as_str() {
+                        Ok(HbbHttpResponse::Error(err_str.to_owned()))
+                    } else {
+                        Ok(HbbHttpResponse::ErrorFormat)
+                    }
+                } else {
+                    match serde_json::from_str::<OidcAuthUrl>(&serde_json::to_string(&map).unwrap_or_default()) {
+                        Ok(v) => Ok(HbbHttpResponse::Data(v)),
+                        Err(e) => {
+                            log::warn!("[OIDC] Unable to parse Data type (OidcAuthUrl): {}", e);
+                            Ok(HbbHttpResponse::DataTypeFormat)
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                log::error!("[OIDC] JSON Map parse error: {}\nRaw Body: {}", e, raw);
+                Ok(HbbHttpResponse::ErrorFormat)
+            }
+        }
     }
 
     fn query(
@@ -212,13 +274,64 @@ impl OidcSession {
             masked_id,
             masked_uuid
         );
-        Ok(OIDC_SESSION
-            .read()
-            .unwrap()
-            .client
-            .get(url)
-            .send()?
-            .try_into()?)
+
+        // Full request logging (unmasked) for troubleshooting
+        log::debug!("[OIDC][RAW] -> GET {}", url);
+        let client = { OIDC_SESSION.read().unwrap().client.clone() };
+        let resp = match client.get(url.clone()).send() {
+            Ok(r) => r,
+            Err(e) => {
+                log::error!("[OIDC][RAW] GET send error: {}\nURL: {}", e, url);
+                return Err(e.into());
+            }
+        };
+        let status = resp.status();
+        let headers = resp.headers().clone();
+        let final_url = resp.url().clone();
+        let raw = match resp.text() {
+            Ok(t) => t,
+            Err(e) => {
+                log::error!(
+                    "[OIDC][RAW] Error reading response body: {}\nStatus: {}\nURL: {}\nHeaders: {:?}",
+                    e,
+                    status,
+                    final_url,
+                    headers
+                );
+                return Err(e.into());
+            }
+        };
+        log::debug!(
+            "[OIDC][RAW] <- Response\nStatus: {}\nURL: {}\nHeaders: {:?}\nBody: {}",
+            status,
+            final_url,
+            headers,
+            raw
+        );
+
+        match serde_json::from_str::<JsonMap<String, JsonValue>>(&raw) {
+            Ok(map) => {
+                if let Some(error) = map.get("error") {
+                    if let Some(err_str) = error.as_str() {
+                        Ok(HbbHttpResponse::Error(err_str.to_owned()))
+                    } else {
+                        Ok(HbbHttpResponse::ErrorFormat)
+                    }
+                } else {
+                    match serde_json::from_str::<AuthBody>(&serde_json::to_string(&map).unwrap_or_default()) {
+                        Ok(v) => Ok(HbbHttpResponse::Data(v)),
+                        Err(e) => {
+                            log::warn!("[OIDC] Unable to parse Data type (AuthBody): {}", e);
+                            Ok(HbbHttpResponse::DataTypeFormat)
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                log::error!("[OIDC] JSON Map parse error: {}\nRaw Body: {}", e, raw);
+                Ok(HbbHttpResponse::ErrorFormat)
+            }
+        }
     }
 
     fn reset(&mut self) {
