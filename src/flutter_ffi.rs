@@ -2084,14 +2084,23 @@ pub fn install_install_options() -> SyncReturn<String> {
 pub fn main_account_auth(op: String, remember_me: bool) {
     let id = get_id();
     let uuid = get_uuid();
+    log::trace!(
+        "[OIDC][FFI] main_account_auth -> op='{}', remember_me={}, id_len={}, uuid_len={}",
+        op,
+        remember_me,
+        id.len(),
+        uuid.len()
+    );
     account_auth(op, id, uuid, remember_me);
 }
 
 pub fn main_account_auth_cancel() {
+    log::trace!("[OIDC][FFI] main_account_auth_cancel");
     account_auth_cancel()
 }
 
 pub fn main_account_auth_result() -> String {
+    log::trace!("[OIDC][FFI] main_account_auth_result");
     account_auth_result()
 }
 

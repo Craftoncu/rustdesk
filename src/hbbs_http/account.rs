@@ -130,7 +130,7 @@ impl Default for UserStatus {
 
 impl OidcSession {
     fn new() -> Self {
-        Self {
+        let s = Self {
             client: create_http_client(),
             state_msg: REQUESTING_ACCOUNT_AUTH,
             failed_msg: "".to_owned(),
@@ -139,7 +139,12 @@ impl OidcSession {
             keep_querying: false,
             running: false,
             query_timeout: Duration::from_secs(QUERY_TIMEOUT_SECS),
-        }
+        };
+        log::trace!(
+            "[OIDC] OidcSession::new -> initialized with query_timeout={}s",
+            QUERY_TIMEOUT_SECS
+        );
+        s
     }
 
     fn auth(
@@ -148,6 +153,22 @@ impl OidcSession {
         id: &str,
         uuid: &str,
     ) -> ResultType<HbbHttpResponse<OidcAuthUrl>> {
+        // Prepare request body so we can log it
+        let device_info = crate::ui_interface::get_login_device_info();
+        let masked_id = format!("{}*** (len={})", &id.chars().take(3).collect::<String>(), id.len());
+        let masked_uuid = format!(
+            "{}*** (len={})",
+            &uuid.chars().take(3).collect::<String>(),
+            uuid.len()
+        );
+        log::trace!(
+            "[OIDC] auth -> POST {}/api/oidc/auth op='{}' id='{}' uuid='{}' device_info={:?}",
+            api_server,
+            op,
+            masked_id,
+            masked_uuid,
+            device_info
+        );
         Ok(OIDC_SESSION
             .read()
             .unwrap()
@@ -157,7 +178,7 @@ impl OidcSession {
                 "op": op,
                 "id": id,
                 "uuid": uuid,
-                "deviceInfo": crate::ui_interface::get_login_device_info(),
+                "deviceInfo": device_info,
             }))
             .send()?
             .try_into()?)
@@ -173,6 +194,24 @@ impl OidcSession {
             &format!("{}/api/oidc/auth-query", api_server),
             &[("code", code), ("id", id), ("uuid", uuid)],
         )?;
+        let masked_code = format!(
+            "{}*** (len={})",
+            &code.chars().take(4).collect::<String>(),
+            code.len()
+        );
+        let masked_id = format!("{}*** (len={})", &id.chars().take(3).collect::<String>(), id.len());
+        let masked_uuid = format!(
+            "{}*** (len={})",
+            &uuid.chars().take(3).collect::<String>(),
+            uuid.len()
+        );
+        log::trace!(
+            "[OIDC] query -> GET {} (code='{}', id='{}', uuid='{}')",
+            url,
+            masked_code,
+            masked_id,
+            masked_uuid
+        );
         Ok(OIDC_SESSION
             .read()
             .unwrap()
@@ -189,27 +228,39 @@ impl OidcSession {
         self.running = false;
         self.code_url = None;
         self.auth_body = None;
+        log::trace!("[OIDC] reset -> state='{}', keep_querying={}, running={}", self.state_msg, self.keep_querying, self.running);
     }
 
     fn before_task(&mut self) {
         self.reset();
         self.running = true;
+        log::debug!("[OIDC] before_task -> starting auth job");
     }
 
     fn after_task(&mut self) {
         self.running = false;
+        log::debug!("[OIDC] after_task -> auth job finished");
     }
 
     fn sleep(secs: f32) {
+        log::trace!("[OIDC] sleep -> {}s", secs);
         std::thread::sleep(std::time::Duration::from_secs_f32(secs));
     }
 
     fn auth_task(api_server: String, op: String, id: String, uuid: String, remember_me: bool) {
+        log::info!(
+            "[OIDC] auth_task -> begin (op='{}', remember_me={}, id_len={}, uuid_len={})",
+            op,
+            remember_me,
+            id.len(),
+            uuid.len()
+        );
         let auth_request_res = Self::auth(&api_server, &op, &id, &uuid);
-        log::info!("Request oidc auth result: {:?}", &auth_request_res);
+        log::info!("[OIDC] auth_task -> auth response: {:?}", &auth_request_res);
         let code_url = match auth_request_res {
             Ok(HbbHttpResponse::<_>::Data(code_url)) => code_url,
             Ok(HbbHttpResponse::<_>::Error(err)) => {
+                log::warn!("[OIDC] auth_task -> server returned error on auth: {}", err);
                 OIDC_SESSION
                     .write()
                     .unwrap()
@@ -217,6 +268,7 @@ impl OidcSession {
                 return;
             }
             Ok(_) => {
+                log::error!("[OIDC] auth_task -> invalid auth response variant");
                 OIDC_SESSION
                     .write()
                     .unwrap()
@@ -224,6 +276,7 @@ impl OidcSession {
                 return;
             }
             Err(err) => {
+                log::error!("[OIDC] auth_task -> request error: {}", err);
                 OIDC_SESSION
                     .write()
                     .unwrap()
@@ -236,15 +289,40 @@ impl OidcSession {
             .write()
             .unwrap()
             .set_state(WAITING_ACCOUNT_AUTH, "".to_owned());
+        log::debug!(
+            "[OIDC] auth_task -> received code_url (code_len={}, url={})",
+            code_url.code.len(),
+            code_url.url
+        );
         OIDC_SESSION.write().unwrap().code_url = Some(code_url.clone());
 
         let begin = Instant::now();
         let query_timeout = OIDC_SESSION.read().unwrap().query_timeout;
+        let mut iter: u64 = 0;
         while OIDC_SESSION.read().unwrap().keep_querying && begin.elapsed() < query_timeout {
+            iter += 1;
+            log::trace!(
+                "[OIDC] auth_task -> polling iteration={} elapsed_ms={} keep_querying={}",
+                iter,
+                begin.elapsed().as_millis(),
+                OIDC_SESSION.read().unwrap().keep_querying
+            );
             match Self::query(&api_server, &code_url.code, &id, &uuid) {
                 Ok(HbbHttpResponse::<_>::Data(auth_body)) => {
+                    log::debug!("[OIDC] auth_task -> query returned Data (type='{}')", auth_body.r#type);
                     if auth_body.r#type == "access_token" {
+                        let token_preview = &auth_body
+                            .access_token
+                            .chars()
+                            .take(8)
+                            .collect::<String>();
+                        log::info!(
+                            "[OIDC] auth_task -> received access token (len={}, preview='{}***')",
+                            auth_body.access_token.len(),
+                            token_preview
+                        );
                         if remember_me {
+                            log::trace!("[OIDC] auth_task -> remember_me=true, persisting access_token and user_info");
                             LocalConfig::set_option(
                                 "access_token".to_owned(),
                                 auth_body.access_token.clone(),
@@ -260,12 +338,15 @@ impl OidcSession {
                         .unwrap()
                         .set_state(LOGIN_ACCOUNT_AUTH, "".to_owned());
                     OIDC_SESSION.write().unwrap().auth_body = Some(auth_body);
+                    log::info!("[OIDC] auth_task -> login state set, auth_body stored; finishing");
                     return;
                 }
                 Ok(HbbHttpResponse::<_>::Error(err)) => {
                     if err.contains("No authed oidc is found") {
                         // ignore, keep querying
+                        log::trace!("[OIDC] auth_task -> not authorized yet; continuing to poll");
                     } else {
+                        log::warn!("[OIDC] auth_task -> server returned error during query: {}", err);
                         OIDC_SESSION
                             .write()
                             .unwrap()
@@ -275,9 +356,10 @@ impl OidcSession {
                 }
                 Ok(_) => {
                     // ignore
+                    log::trace!("[OIDC] auth_task -> unexpected query response variant; ignoring");
                 }
                 Err(err) => {
-                    log::trace!("Failed query oidc {}", err);
+                    log::trace!("[OIDC] auth_task -> query error: {}", err);
                     // ignore
                 }
             }
@@ -285,6 +367,10 @@ impl OidcSession {
         }
 
         if begin.elapsed() >= query_timeout {
+            log::warn!(
+                "[OIDC] auth_task -> polling timed out after {:?}",
+                begin.elapsed()
+            );
             OIDC_SESSION
                 .write()
                 .unwrap()
@@ -295,15 +381,22 @@ impl OidcSession {
     }
 
     fn set_state(&mut self, state_msg: &'static str, failed_msg: String) {
+        log::debug!(
+            "[OIDC] set_state -> {:?} (failed_msg='{}')",
+            state_msg,
+            failed_msg
+        );
         self.state_msg = state_msg;
         self.failed_msg = failed_msg;
     }
 
     fn wait_stop_querying() {
         let wait_secs = 0.3;
+        log::trace!("[OIDC] wait_stop_querying -> waiting for running job to finish");
         while OIDC_SESSION.read().unwrap().running {
             Self::sleep(wait_secs);
         }
+        log::trace!("[OIDC] wait_stop_querying -> done");
     }
 
     pub fn account_auth(
@@ -313,6 +406,13 @@ impl OidcSession {
         uuid: String,
         remember_me: bool,
     ) {
+        log::info!(
+            "[OIDC] account_auth -> requested (op='{}', id_len={}, uuid_len={}, remember_me={})",
+            op,
+            id.len(),
+            uuid.len(),
+            remember_me
+        );
         Self::auth_cancel();
         Self::wait_stop_querying();
         OIDC_SESSION.write().unwrap().before_task();
@@ -332,10 +432,19 @@ impl OidcSession {
     }
 
     pub fn auth_cancel() {
+        log::info!("[OIDC] auth_cancel -> stop polling requested");
         OIDC_SESSION.write().unwrap().keep_querying = false;
     }
 
     pub fn get_result() -> AuthResult {
-        OIDC_SESSION.read().unwrap().get_result_()
+        let result = OIDC_SESSION.read().unwrap().get_result_();
+        log::trace!(
+            "[OIDC] get_result -> state='{}', failed_msg='{}', url_present={}, auth_body_present={}",
+            result.state_msg,
+            result.failed_msg,
+            result.url.is_some(),
+            result.auth_body.is_some()
+        );
+        result
     }
 }

@@ -1088,16 +1088,25 @@ fn check_connect_status(reconnect: bool) -> mpsc::UnboundedSender<ipc::Data> {
 
 #[cfg(feature = "flutter")]
 pub fn account_auth(op: String, id: String, uuid: String, remember_me: bool) {
+    log::trace!(
+        "[OIDC][UI] account_auth -> op='{}', id_len={}, uuid_len={}, remember_me={}",
+        op,
+        id.len(),
+        uuid.len(),
+        remember_me
+    );
     account::OidcSession::account_auth(get_api_server(), op, id, uuid, remember_me);
 }
 
 #[cfg(feature = "flutter")]
 pub fn account_auth_cancel() {
+    log::trace!("[OIDC][UI] account_auth_cancel");
     account::OidcSession::auth_cancel();
 }
 
 #[cfg(feature = "flutter")]
 pub fn account_auth_result() -> String {
+    log::trace!("[OIDC][UI] account_auth_result -> fetching current result");
     serde_json::to_string(&account::OidcSession::get_result()).unwrap_or_default()
 }
 
